@@ -1,69 +1,155 @@
+require('dotenv').config();
 const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
+const morgan = require('morgan');
+
+// Configuración
+const config = require('./config');
+const { connectDatabases, disconnectDatabases } = require('./config/database');
+const errorHandler = require('./middleware/errorHandler');
+const { logRequest } = require('./utils/logger');
+const { responseWrapper } = require('./utils/response');
+const authService = require('./services/auth.service');
+
+// Importar rutas
+const authRoutes = require('./routes/auth.routes');
+const stockRoutes = require('./routes/stock.routes');
+const healthRoutes = require('./routes/health.routes');
+
+// Crear aplicación Express
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = config.server.port;
 
-app.use(express.json());
+// ========== MIDDLEWARES GLOBALES ==========
+// Seguridad
+app.use(helmet());
+app.use(cors());
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    service: 'gateway',
-    timestamp: new Date().toISOString()
-  });
-});
+// Logging
+app.use(morgan(config.server.env === 'development' ? 'dev' : 'combined'));
+app.use(logRequest);
 
-// Login simulado
-app.post('/api/auth/login', (req, res) => {
-  const { username, password } = req.body;
-  
-  if (username === 'admin' && password === 'admin123') {
-    res.json({ 
-      token: 'test-token-industrial-12345' 
-    });
-  } else {
-    res.status(401).json({ error: 'Credenciales inválidas' });
-  }
-});
+// Parseo de JSON
+app.use(express.json({ limit: '10mb' }));
 
-// Endpoint simulado (sin conectar al API todavía)
-app.post('/api/v1/industrial/stock', (req, res) => {
-  console.log('Consulta recibida:', req.body);
-  
-  // Respuesta simulada
+// Formato de respuesta estándar
+app.use(responseWrapper);
+
+// ========== RUTAS ==========
+// Pública
+app.use('/api/auth', authRoutes);
+app.use('/health', healthRoutes);
+
+// Protegidas (stock)
+app.use('/api/v1/industrial', stockRoutes);
+
+// Ruta raíz
+app.get('/', (req, res) => {
   res.json({
-    product_id: req.body.product_id || 'CASCO-001',
-    product_name: 'Casco de Seguridad Tipo II',
-    category: 'EPP',
-    warehouse_id: req.body.warehouse_id || 'BOD-01',
-    current_stock: 250,
-    reserved_stock: 45,
-    available_stock: 205,
-    reorder_point: 50,
-    safety_level: 'ALTO',
-    certification: 'ANSI Z89.1',
-    response_time_ms: 120.5,
-    needs_reorder: false,
-    note: 'Respuesta del gateway (API simulado)'
+    service: 'Industrial Stock Gateway',
+    version: '1.0.0',
+    status: 'operational',
+    environment: config.server.env,
+    endpoints: {
+      auth: '/api/auth',
+      stock: '/api/v1/industrial/stock',
+      health: '/health',
+      docs: '/api-docs' // Podrías agregar Swagger después
+    },
+    asr: {
+      latency: '< 3000ms para 5000 consultas/min',
+      security: 'Protección contra DoS',
+      maintainability: 'Cambios en < 4 horas'
+    }
   });
 });
 
-// Alertas simuladas
-app.get('/api/v1/industrial/alerts', (req, res) => {
-  res.json([
-    {
-      product_id: 'RESP-001',
-      product_name: 'Respirador N95',
-      alert: 'STOCK BAJO CRÍTICO',
-      current: 15,
-      minimum: 30,
-      urgency: 'ALTA',
-      message: 'Solo quedan 15 cajas de respiradores'
-    }
-  ]);
+// Ruta 404
+app.use('*', (req, res) => {
+  res.status(404).json({
+    error: 'Ruta no encontrada',
+    message: `La ruta ${req.originalUrl} no existe`,
+    availableEndpoints: [
+      'GET /',
+      'POST /api/auth/login',
+      'POST /api/v1/industrial/stock',
+      'GET /health',
+      'GET /health/detailed'
+    ]
+  });
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Gateway corriendo en puerto ${PORT}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+// ========== MANEJO DE ERRORES ==========
+app.use(errorHandler);
+
+// ========== INICIAR SERVIDOR ==========
+async function startServer() {
+  try {
+    console.log('🚀 Iniciando Industrial Stock Gateway...');
+    console.log(`🌍 Ambiente: ${config.server.env}`);
+    
+    // 1. Conectar a bases de datos
+    console.log('🔗 Conectando a bases de datos...');
+    await connectDatabases();
+    
+    // 2. Inicializar usuarios de prueba
+    if (config.server.env === 'development') {
+      console.log('👤 Inicializando usuarios de prueba...');
+      await authService.initializeTestUsers();
+    }
+    
+    // 3. Iniciar servidor
+    app.listen(PORT, () => {
+      console.log(`✅ Gateway corriendo en: http://localhost:${PORT}`);
+      console.log(`📊 Health check: http://localhost:${PORT}/health`);
+      console.log(`🔐 Login test: POST http://localhost:${PORT}/api/auth/login`);
+      console.log(`📦 Stock test: POST http://localhost:${PORT}/api/v1/industrial/stock`);
+      console.log('=' .repeat(50));
+    });
+    
+  } catch (error) {
+    console.error('❌ Error al iniciar servidor:', error);
+    process.exit(1);
+  }
+}
+
+// ========== MANEJO DE SHUTDOWN ==========
+async function shutdown(signal) {
+  console.log(`\n🛑 Recibido ${signal}, cerrando servidor...`);
+  
+  try {
+    // Cerrar conexiones a bases de datos
+    await disconnectDatabases();
+    console.log('✅ Conexiones cerradas correctamente');
+    
+    // Salir
+    setTimeout(() => {
+      console.log('👋 Servidor detenido');
+      process.exit(0);
+    }, 1000);
+  } catch (error) {
+    console.error('❌ Error durante shutdown:', error);
+    process.exit(1);
+  }
+}
+
+// Capturar señales de terminación
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Manejo de errores no capturados
+process.on('uncaughtException', (error) => {
+  console.error('💥 Error no capturado:', error);
+  shutdown('uncaughtException');
 });
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 Promise rechazada no manejada:', reason);
+  shutdown('unhandledRejection');
+});
+
+// Iniciar servidor
+startServer();
+
+module.exports = app; // Para testing
